@@ -2,38 +2,59 @@
 
 namespace Dingo\Api\Tests;
 
-use Mockery;
+use Mockery as m;
+use Dingo\Api\Http;
+use Dingo\Api\Auth\Auth;
+use Dingo\Api\Dispatcher;
+use Illuminate\Http\Request;
+use Dingo\Api\Http\Response;
+use Dingo\Api\Routing\Router;
 use PHPUnit_Framework_TestCase;
+use Dingo\Api\Tests\Stubs\UserStub;
+use Illuminate\Container\Container;
+use Illuminate\Filesystem\Filesystem;
+use Dingo\Api\Tests\Stubs\MiddlewareStub;
+use Dingo\Api\Tests\Stubs\TransformerStub;
+use Dingo\Api\Tests\Stubs\RoutingAdapterStub;
+use Dingo\Api\Tests\Stubs\UserTransformerStub;
+use Dingo\Api\Exception\InternalHttpException;
+use Dingo\Api\Transformer\Factory as TransformerFactory;
+use Illuminate\Support\Facades\Request as RequestFacade;
 
 class DispatcherTest extends PHPUnit_Framework_TestCase
 {
     public function setUp()
     {
-        $this->router = new \Dingo\Api\Routing\Router(new \Illuminate\Events\Dispatcher);
-        $this->router->setDefaultVersion('v1');
-        $this->router->setVendor('testing');
+        $this->container = new Container;
+        $this->container['request'] = Request::create('/', 'GET');
+        $this->container['api.auth'] = new MiddlewareStub;
+        $this->container['api.limiting'] = new MiddlewareStub;
 
-        $this->request = \Illuminate\Http\Request::create('/', 'GET');
-        $this->auth = new \Dingo\Api\Auth\Authenticator($this->router, new \Illuminate\Container\Container, []);
+        $this->transformerFactory = new TransformerFactory($this->container, new TransformerStub);
 
-        $this->dispatcher = new \Dingo\Api\Dispatcher(
-            $this->request,
-            new \Illuminate\Routing\UrlGenerator(new \Illuminate\Routing\RouteCollection, $this->request),
-            $this->router,
-            $this->auth
-        );
+        $this->adapter = new RoutingAdapterStub;
+        $this->exception = m::mock('Dingo\Api\Exception\Handler');
+        $this->router = new Router($this->adapter, new Http\Parser\Accept('api', 'v1', 'json'), $this->exception, $this->container, null, null);
+
+        $this->auth = new Auth($this->router, $this->container, []);
+        $this->dispatcher = new Dispatcher($this->container, new Filesystem, $this->router, $this->auth);
+
+        $this->dispatcher->setVendor('api');
+        $this->dispatcher->setDefaultVersion('v1');
+        $this->dispatcher->setDefaultFormat('json');
+
+        Http\Response::setFormatters(['json' => new Http\Response\Format\Json]);
+        Http\Response::setTransformer($this->transformerFactory);
     }
-
 
     public function tearDown()
     {
-        Mockery::close();
+        m::close();
     }
-
 
     public function testInternalRequests()
     {
-        $this->router->api(['version' => 'v1'], function () {
+        $this->router->version('v1', function () {
             $this->router->get('test', function () {
                 return 'foo';
             });
@@ -62,84 +83,99 @@ class DispatcherTest extends PHPUnit_Framework_TestCase
         $this->assertEquals('yang', $this->dispatcher->delete('test'));
     }
 
-
     public function testInternalRequestWithVersionAndParameters()
     {
-        $this->router->api(['version' => 'v1'], function()
-        {
-            $this->router->get('test', function(){ return 'test'; });
+        $this->router->version('v1', function () {
+            $this->router->get('test', function () { return 'test'; });
         });
 
         $this->assertEquals('test', $this->dispatcher->version('v1')->with(['foo' => 'bar'])->get('test'));
     }
 
-
     public function testInternalRequestWithPrefix()
     {
-        $this->router->api(['version' => 'v1', 'prefix' => 'baz'], function () {
-            $this->router->get('test', function() {
-                return 'test';
-            });
-        });
-
-        $this->assertEquals('test', $this->dispatcher->get('test'));
-    }
-
-
-    public function testInternalRequestWithDomain()
-    {
-        $this->router->api(['version' => 'v1', 'domain' => 'foo.bar'], function() {
+        $this->router->version('v1', ['prefix' => 'baz'], function () {
             $this->router->get('test', function () {
                 return 'test';
             });
         });
 
+        $this->assertEquals('test', $this->dispatcher->get('baz/test'));
+
+        $this->dispatcher->setPrefix('baz');
+
         $this->assertEquals('test', $this->dispatcher->get('test'));
     }
 
+    public function testInternalRequestWithDomain()
+    {
+        $this->router->version('v1', ['domain' => 'foo.bar'], function () {
+            $this->router->get('test', function () {
+                return 'test';
+            });
+        });
+
+        $this->assertEquals('test', $this->dispatcher->get('http://foo.bar/test'));
+
+        $this->dispatcher->setDefaultDomain('foo.bar');
+
+        $this->assertEquals('test', $this->dispatcher->get('test'));
+    }
 
     /**
-     * @expectedException Symfony\Component\HttpKernel\Exception\HttpException
+     * @expectedException \Dingo\Api\Exception\InternalHttpException
      */
-    public function testInternalRequestThrowsException()
+    public function testInternalRequestThrowsExceptionWhenResponseIsNotOkay()
     {
-        $this->router->api(['version' => 'v1'], function () {
-            //
+        $this->router->version('v1', function () {
+            $this->router->get('test', function () {
+                return new \Illuminate\Http\Response('test', 403);
+            });
         });
 
         $this->dispatcher->get('test');
     }
 
-
-    /**
-     * @expectedException Symfony\Component\HttpKernel\Exception\HttpException
-     */
-    public function testInternalRequestThrowsExceptionWhenResponseIsNotOkay()
+    public function testInternalExceptionContainsResponseObject()
     {
-        $this->router->api(['version' => 'v1'], function () {
+        $this->router->version('v1', function () {
             $this->router->get('test', function () {
                 return new \Illuminate\Http\Response('test', 401);
             });
         });
 
-        $this->dispatcher->get('test');
+        try {
+            $this->dispatcher->get('test');
+        } catch (InternalHttpException $exception) {
+            $this->assertInstanceOf('Illuminate\Http\Response', $exception->getResponse());
+            $this->assertEquals('test', $exception->getResponse()->getContent());
+        }
     }
 
-
-    /**
-     * @expectedException \RuntimeException
-     */
-    public function testPretendingToBeUserWithInvalidParameterThrowsException()
+    public function testThrowingHttpExceptionFallsThroughRouter()
     {
-        $this->dispatcher->be('foo');
-    }
+        $this->router->version('v1', function () {
+            $this->router->get('test', function () {
+                throw new \Symfony\Component\HttpKernel\Exception\GoneHttpException;
+            });
+        });
 
+        $passed = false;
+
+        try {
+            $this->dispatcher->get('test');
+        } catch (\Symfony\Component\HttpKernel\Exception\GoneHttpException $exception) {
+            $passed = true;
+        }
+
+        $this->assertTrue($passed);
+    }
 
     public function testPretendingToBeUserForSingleRequest()
     {
-        $user = Mockery::mock('Illuminate\Database\Eloquent\Model');
+        $user = m::mock('Illuminate\Database\Eloquent\Model');
 
-        $this->router->api(['version' => 'v1'], function () use ($user) {
+        $this->router->version('v1', function () use ($user) {
             $this->router->get('test', function () use ($user) {
                 $this->assertEquals($user, $this->auth->user());
             });
@@ -148,57 +184,16 @@ class DispatcherTest extends PHPUnit_Framework_TestCase
         $this->dispatcher->be($user)->once()->get('test');
     }
 
-
-    public function testInternalRequestUsingRouteName()
-    {
-        $this->router->api(['version' => 'v1'], function () {
-            $this->router->get('test', ['as' => 'test', function () {
-                return 'foo';
-            }]);
-
-            $this->router->get('test/{foo}', ['as' => 'parameters', function ($parameter) {
-                return $parameter;
-            }]);
-        });
-
-        $this->assertEquals('foo', $this->dispatcher->route('test'));
-        $this->assertEquals('bar', $this->dispatcher->route('parameters', 'bar'));
-    }
-
-
-    public function testInternalRequestUsingControllerAction()
-    {
-        $this->router->api(['version' => 'v1'], function () {
-            $this->router->get('foo', 'Dingo\Api\Tests\Stubs\InternalControllerDispatchingStub@index');
-        });
-
-        $this->assertEquals('foo', $this->dispatcher->action('Dingo\Api\Tests\Stubs\InternalControllerDispatchingStub@index'));
-    }
-
-
-    public function testInternalRequestUsingRouteNameAndControllerAction()
-    {
-        $this->router->api(['version' => 'v1', 'prefix' => 'api'], function ()
-        {
-            $this->router->get('foo', ['as' => 'foo', function () { return 'foo'; }]);
-            $this->router->get('bar', 'Dingo\Api\Tests\Stubs\InternalControllerDispatchingStub@index');
-        });
-
-        $this->assertEquals('foo', $this->dispatcher->route('foo'));
-        $this->assertEquals('foo', $this->dispatcher->action('Dingo\Api\Tests\Stubs\InternalControllerDispatchingStub@index'));
-    }
-
-
     public function testInternalRequestWithMultipleVersionsCallsCorrectVersion()
     {
-        $this->router->api(['version' => 'v1'], function () {
+        $this->router->version('v1', function () {
             $this->router->get('foo', function () {
                 return 'foo';
             });
         });
 
-        $this->router->api(['version' => ['v2', 'v3']], function () {
-            $this->router->get('foo', function() {
+        $this->router->version(['v2', 'v3'], function () {
+            $this->router->get('foo', function () {
                 return 'bar';
             });
         });
@@ -208,22 +203,21 @@ class DispatcherTest extends PHPUnit_Framework_TestCase
         $this->assertEquals('bar', $this->dispatcher->version('v3')->get('foo'));
     }
 
-
     public function testInternalRequestWithNestedInternalRequest()
     {
-        $this->router->api(['version' => 'v1'], function () {
+        $this->router->version('v1', function () {
             $this->router->get('foo', function () {
                 return 'foo'.$this->dispatcher->version('v2')->get('foo');
             });
         });
 
-        $this->router->api(['version' => 'v2'], function () {
+        $this->router->version('v2', function () {
             $this->router->get('foo', function () {
                 return 'bar'.$this->dispatcher->version('v3')->get('foo');
             });
         });
 
-        $this->router->api(['version' => 'v3'], function () {
+        $this->router->version('v3', function () {
             $this->router->get('foo', function () {
                 return 'baz';
             });
@@ -232,19 +226,18 @@ class DispatcherTest extends PHPUnit_Framework_TestCase
         $this->assertEquals('foobarbaz', $this->dispatcher->get('foo'));
     }
 
-
     public function testRequestStackIsMaintained()
     {
-        $this->router->api(['version' => 'v1', 'prefix' => 'api'], function () {
+        $this->router->version('v1', ['prefix' => 'api'], function () {
             $this->router->post('foo', function () {
                 $this->assertEquals('bar', $this->router->getCurrentRequest()->input('foo'));
-                $this->dispatcher->with(['foo' => 'baz'])->post('bar');
+                $this->dispatcher->with(['foo' => 'baz'])->post('api/bar');
                 $this->assertEquals('bar', $this->router->getCurrentRequest()->input('foo'));
             });
 
             $this->router->post('bar', function () {
                 $this->assertEquals('baz', $this->router->getCurrentRequest()->input('foo'));
-                $this->dispatcher->with(['foo' => 'bazinga'])->post('baz');
+                $this->dispatcher->with(['foo' => 'bazinga'])->post('api/baz');
                 $this->assertEquals('baz', $this->router->getCurrentRequest()->input('foo'));
             });
 
@@ -253,30 +246,122 @@ class DispatcherTest extends PHPUnit_Framework_TestCase
             });
         });
 
-        $this->dispatcher->with(['foo' => 'bar'])->post('foo');
+        $this->dispatcher->with(['foo' => 'bar'])->post('api/foo');
     }
-
 
     public function testRouteStackIsMaintained()
     {
-        $this->router->api(['version' => 'v1'], function () {
-            $this->router->post('foo', ['as' => 'foo', function() {
-                $this->assertEquals('foo', $this->router->currentRouteName());
+        $this->router->version('v1', function () {
+            $this->router->post('foo', ['as' => 'foo', function () {
+                $this->assertEquals('foo', $this->router->getCurrentRoute()->getName());
                 $this->dispatcher->post('bar');
-                $this->assertEquals('foo', $this->router->currentRouteName());
+                $this->assertEquals('foo', $this->router->getCurrentRoute()->getName());
             }]);
 
             $this->router->post('bar', ['as' => 'bar', function () {
-                $this->assertEquals('bar', $this->router->currentRouteName());
+                $this->assertEquals('bar', $this->router->getCurrentRoute()->getName());
                 $this->dispatcher->post('baz');
-                $this->assertEquals('bar', $this->router->currentRouteName());
+                $this->assertEquals('bar', $this->router->getCurrentRoute()->getName());
             }]);
 
             $this->router->post('baz', ['as' => 'bazinga', function () {
-                $this->assertEquals('bazinga', $this->router->currentRouteName());
+                $this->assertEquals('bazinga', $this->router->getCurrentRoute()->getName());
             }]);
         });
 
         $this->dispatcher->post('foo');
+    }
+
+    public function testSendingJsonPayload()
+    {
+        $this->router->version('v1', function () {
+            $this->router->post('foo', function () {
+                $this->assertEquals('jason', $this->router->getCurrentRequest()->json('username'));
+            });
+
+            $this->router->post('bar', function () {
+                $this->assertEquals('mat', $this->router->getCurrentRequest()->json('username'));
+            });
+        });
+
+        $this->dispatcher->json(['username' => 'jason'])->post('foo');
+        $this->dispatcher->json('{"username":"mat"}')->post('bar');
+    }
+
+    public function testInternalRequestsToDifferentDomains()
+    {
+        $this->router->version(['v1', 'v2'], ['domain' => 'foo.bar'], function () {
+            $this->router->get('foo', function () {
+                return 'v1 and v2 on domain foo.bar';
+            });
+        });
+
+        $this->router->version('v1', ['domain' => 'foo.baz'], function () {
+            $this->router->get('foo', function () {
+                return 'v1 on domain foo.baz';
+            });
+        });
+
+        $this->router->version('v2', ['domain' => 'foo.baz'], function () {
+            $this->router->get('foo', function () {
+                return 'v2 on domain foo.baz';
+            });
+        });
+
+        $this->assertEquals('v1 and v2 on domain foo.bar', $this->dispatcher->on('foo.bar')->version('v2')->get('foo'));
+        $this->assertEquals('v1 on domain foo.baz', $this->dispatcher->on('foo.baz')->get('foo'));
+        $this->assertEquals('v2 on domain foo.baz', $this->dispatcher->on('foo.baz')->version('v2')->get('foo'));
+    }
+
+    public function testRequestingRawResponse()
+    {
+        $this->router->version('v1', function () {
+            $this->router->get('foo', function () {
+                return ['foo' => 'bar'];
+            });
+        });
+
+        $response = $this->dispatcher->raw()->get('foo');
+
+        $this->assertInstanceOf('Dingo\Api\Http\Response', $response);
+        $this->assertEquals('{"foo":"bar"}', $response->getContent());
+        $this->assertEquals(['foo' => 'bar'], $response->getOriginalContent());
+    }
+
+    public function testRequestingRawResponseWithTransformers()
+    {
+        $instance = null;
+
+        $this->router->version('v1', function () use (&$instance) {
+            $this->router->get('foo', function () use (&$instance) {
+                return $instance = new UserStub('Jason');
+            });
+        });
+
+        $this->transformerFactory->register(UserStub::class, UserTransformerStub::class);
+
+        $response = $this->dispatcher->raw()->get('foo');
+
+        $this->assertInstanceOf('Dingo\Api\Http\Response', $response);
+        $this->assertEquals('{"name":"Jason"}', $response->getContent());
+        $this->assertEquals($instance, $response->getOriginalContent());
+    }
+
+    public function testUsingRequestFacadeDoesNotCacheRequestInstance()
+    {
+        RequestFacade::setFacadeApplication($this->container);
+
+        $this->router->version('v1', function () {
+            $this->router->get('foo', function () {
+                return RequestFacade::input('foo');
+            });
+        });
+
+        $this->assertNull(RequestFacade::input('foo'));
+
+        $response = $this->dispatcher->with(['foo' => 'bar'])->get('foo');
+
+        $this->assertEquals('bar', $response);
+        $this->assertNull(RequestFacade::input('foo'));
     }
 }

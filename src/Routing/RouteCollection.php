@@ -2,143 +2,118 @@
 
 namespace Dingo\Api\Routing;
 
-use Illuminate\Http\Request;
-use Dingo\Api\Http\Response;
-use Illuminate\Routing\RouteCollection as IlluminateRouteCollection;
+use Countable;
+use ArrayIterator;
+use IteratorAggregate;
 
-class RouteCollection extends IlluminateRouteCollection
+class RouteCollection implements Countable, IteratorAggregate
 {
     /**
-     * Version of this collection of routes.
-     *
-     * @var string
-     */
-    protected $version;
-
-    /**
-     * Options specified on this collection of routes.
+     * Routes on the collection.
      *
      * @var array
      */
-    protected $options;
+    protected $routes = [];
 
     /**
-     * Create a new API route collection instance.
+     * Lookup for named routes.
      *
-     * @param  string  $version
-     * @param  array  $options
+     * @var array
+     */
+    protected $names = [];
+
+    /**
+     * Lookup for action routes.
+     *
+     * @var array
+     */
+    protected $actions = [];
+
+    /**
+     * Add a route to the collection.
+     *
+     * @param \Dingo\Api\Routing\Route $route
+     *
      * @return void
      */
-    public function __construct($version, array $options = [])
+    public function add(Route $route)
     {
-        $this->version = $version;
-        $this->options = $options;
+        $this->routes[] = $route;
+
+        $this->addLookups($route);
     }
 
     /**
-     * Get an option from the collection.
+     * Add route lookups.
      *
-     * @param  string  $key
-     * @param  mixed  $default
-     * @return mixed
+     * @param \Dingo\Api\Routing\Route $route
+     *
+     * @return void
      */
-    public function option($key, $default = null)
+    protected function addLookups(Route $route)
     {
-        return array_get($this->options, $key, $default);
-    }
+        $action = $route->getAction();
 
-    /**
-     * Determine if the routes within the collection will be a match for
-     * the current request. If no prefix or domain is set on the
-     * collection then it's assumed it will be a match.
-     *
-     * @param  \Illuminate\Http\Request  $request
-     * @return bool
-     */
-    public function matchesRequest(Request $request)
-    {
-        if ($this->matchesCollectionVersion($request)) {
-            if ($this->matchDomain($request)) {
-                return true;
-            } elseif ($this->matchPrefix($request)) {
-                return true;
-            } elseif (! $this->option('prefix') and ! $this->option('domain')) {
-                return true;
-            }
+        if (isset($action['as'])) {
+            $this->names[$action['as']] = $route;
         }
 
-        return false;
-    }
-
-    /**
-     * Determine if the requested version matches the collection version.
-     *
-     * @param  \Illuminate\Http\Request  $request
-     * @return bool
-     */
-    protected function matchesCollectionVersion($request)
-    {
-        if (preg_match('#application/vnd\.\w+.(v[\d\.]+)\+\w+#', $request->header('accept'), $matches)) {
-            list ($accept, $version) = $matches;
-
-            return $version == $this->version;
+        if (isset($action['controller'])) {
+            $this->actions[$action['controller']] = $route;
         }
-
-        return false;
     }
 
     /**
-     * Matches domain if is set on route group.
+     * Get a route by name.
      *
-     * @param  \Illuminate\Http\Request  $request
-     * @return bool
+     * @param string $name
+     *
+     * @return \Dingo\Api\Routing\Route|null
      */
-    protected function matchDomain($request)
+    public function getByName($name)
     {
-        return $this->option('domain') and $request->header('host') == $this->option('domain');
+        return isset($this->names[$name]) ? $this->names[$name] : null;
     }
 
     /**
-     * Matches prefix if is set in route group.
+     * Get a route by action.
      *
-     * @param  \Illuminate\Http\Request  $request
-     * @return bool
+     * @param string $action
+     *
+     * @return \Dingo\Api\Routing\Route|null
      */
-    protected function matchPrefix($request)
+    public function getByAction($action)
     {
-        if (! $prefix = $this->option('prefix')) {
-            return false;
-        }
-
-        $prefix = $this->filterAndExplode($this->option('prefix'));
-
-        $path = $this->filterAndExplode($request->getPathInfo());
-
-        return $prefix == array_slice($path, 0, count($prefix));
+        return isset($this->actions[$action]) ? $this->actions[$action] : null;
     }
 
     /**
-     * Explode array on slash and remove empty values.
+     * Get all routes.
      *
-     * @param  array  $array
      * @return array
      */
-    protected function filterAndExplode($array)
+    public function getRoutes()
     {
-        return array_filter(explode('/', $array));
+        return $this->routes;
     }
 
     /**
-     * {@inheritDoc}
+     * Get an iterator for the items.
+     *
+     * @return \ArrayIterator
      */
-    protected function getOtherMethodsRoute($request, array $others)
+    public function getIterator()
     {
-        if ($request->method() == 'OPTIONS') {
-            return (new Route('OPTIONS', $request->path(), function() use ($others) {
-                return new Response('', 200, ['Allow' => implode(',', $others)]);
-            }))->bind($request);
-        } else {
-            $this->methodNotAllowed($others);
-        }
+        return new ArrayIterator($this->getRoutes());
+    }
+
+    /**
+     * Count the number of items in the collection.
+     *
+     * @return int
+     */
+    public function count()
+    {
+        return count($this->getRoutes());
     }
 }
